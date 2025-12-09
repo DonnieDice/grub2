@@ -30,6 +30,7 @@
 struct grub_efidisk_data
 {
   grub_efi_handle_t handle;
+  char *hw_name;
   grub_efi_device_path_t *device_path;
   grub_efi_device_path_t *last_device_path;
   grub_efi_block_io_t *block_io;
@@ -42,6 +43,9 @@ static grub_efi_guid_t block_io_guid = GRUB_EFI_BLOCK_IO_GUID;
 static struct grub_efidisk_data *fd_devices;
 static struct grub_efidisk_data *hd_devices;
 static struct grub_efidisk_data *cd_devices;
+
+/* Forward declaration */
+static char *get_hw_name (grub_efi_handle_t handle);
 
 static struct grub_efidisk_data *
 make_devices (void)
@@ -97,6 +101,8 @@ make_devices (void)
 	  while (devices)
 	    {
 	      d = devices->next;
+	      if (devices->hw_name)
+		grub_free (devices->hw_name);
 	      grub_free (devices);
 	      devices = d;
 	    }
@@ -205,6 +211,9 @@ add_device (struct grub_efidisk_data **devices, struct grub_efidisk_data *d)
     return;
 
   grub_memcpy (n, d, sizeof (*n));
+  /* Duplicate hw_name if it exists */
+  if (d->hw_name)
+    n->hw_name = grub_strdup (d->hw_name);
   n->next = (*p);
   (*p) = n;
 }
@@ -372,36 +381,91 @@ name_devices (struct grub_efidisk_data *devices)
     }
 }
 
-/* Fetch human-readable hardware name using EFI Device Path protocol */
+/* Extract useful hardware information from device path */
 static char *
 get_hw_name (grub_efi_handle_t handle)
 {
   grub_efi_device_path_t *dp;
+  char *result = NULL;
+  char *full_path = NULL;
   grub_efi_device_path_to_text_protocol_t *dp_text;
   grub_efi_char16_t *text_path;
-  char *hw_name = NULL;
   grub_efi_uintn_t len;
 
   dp = grub_efi_get_device_path (handle);
   if (!dp)
     return NULL;
 
+  /* Try to get the device path to text protocol */
   dp_text = grub_efi_locate_protocol (&grub_efi_device_path_to_text_protocol_guid, 0);
-  if (!dp_text)
-    return NULL;
+  if (dp_text)
+    {
+      text_path = efi_call_3 (dp_text->convert_device_path_to_text, dp, 1, 1);
+      if (text_path)
+	{
+	  /* Convert UTF-16 to UTF-8 */
+	  for (len = 0; text_path[len]; len++);
+	  full_path = grub_malloc ((len + 1) * GRUB_MAX_UTF8_PER_UTF16 + 1);
+	  if (full_path)
+	    *grub_utf16_to_utf8 ((grub_uint8_t *) full_path, text_path, len) = '\0';
+	  
+	  efi_call_1 (grub_efi_system_table->boot_services->free_pool, text_path);
+	}
+    }
 
-  text_path = efi_call_3 (dp_text->convert_device_path_to_text, dp, 1, 1);
-  if (!text_path)
-    return NULL;
+  /* Walk through device path to extract meaningful information */
+  while (dp && GRUB_EFI_DEVICE_PATH_TYPE (dp) != GRUB_EFI_END_DEVICE_PATH_TYPE)
+    {
+      /* Look for SATA/SCSI/NVMe/USB information */
+      if (GRUB_EFI_DEVICE_PATH_TYPE (dp) == GRUB_EFI_MESSAGING_DEVICE_PATH_TYPE)
+	{
+	  switch (GRUB_EFI_DEVICE_PATH_SUBTYPE (dp))
+	    {
+	    case GRUB_EFI_SATA_DEVICE_PATH_SUBTYPE:
+	      {
+		grub_efi_sata_device_path_t *sata = (grub_efi_sata_device_path_t *) dp;
+		result = grub_xasprintf ("SATA Port %u", sata->hba_port);
+		goto done;
+	      }
+	    case GRUB_EFI_USB_DEVICE_PATH_SUBTYPE:
+	      {
+		grub_efi_usb_device_path_t *usb = (grub_efi_usb_device_path_t *) dp;
+		result = grub_xasprintf ("USB Port %u Interface %u", 
+					 usb->parent_port, usb->interface);
+		goto done;
+	      }
+	    case GRUB_EFI_SCSI_DEVICE_PATH_SUBTYPE:
+	      {
+		grub_efi_scsi_device_path_t *scsi = (grub_efi_scsi_device_path_t *) dp;
+		result = grub_xasprintf ("SCSI ID %u LUN %u", scsi->pun, scsi->lun);
+		goto done;
+	      }
+	    case GRUB_EFI_NVME_NAMESPACE_DEVICE_PATH_SUBTYPE:
+	      {
+		/* NVMe device - show namespace */
+		struct {
+		  grub_efi_device_path_t header;
+		  grub_uint32_t namespace_id;
+		  grub_uint64_t ieee_eui_64;
+		} *nvme = (void *) dp;
+		result = grub_xasprintf ("NVMe NS %u", nvme->namespace_id);
+		goto done;
+	      }
+	    }
+	}
+      
+      dp = GRUB_EFI_NEXT_DEVICE_PATH (dp);
+    }
 
-  /* Convert UTF-16 to UTF-8 */
-  for (len = 0; text_path[len]; len++);
-  hw_name = grub_malloc ((len + 1) * GRUB_MAX_UTF8_PER_UTF16 + 1);
-  if (hw_name)
-    *grub_utf16_to_utf8 ((grub_uint8_t *) hw_name, text_path, len) = '\0';
-
-  efi_call_1 (grub_efi_system_table->boot_services->free_pool, text_path);
-  return hw_name;
+done:
+  /* If we got a friendly name, use it. Otherwise fall back to full path */
+  if (!result && full_path)
+    return full_path;
+  
+  if (full_path)
+    grub_free (full_path);
+  
+  return result;
 }
 
 static void
@@ -412,6 +476,8 @@ free_devices (struct grub_efidisk_data *devices)
   for (p = devices; p; p = q)
     {
       q = p->next;
+      if (p->hw_name)
+	grub_free (p->hw_name);
       grub_free (p);
     }
 }
@@ -574,6 +640,9 @@ grub_efidisk_open (const char *name, struct grub_disk *disk)
        (1U << disk->log_sector_size) < m->block_size;
        disk->log_sector_size++);
   disk->data = d;
+  
+  /* Copy hardware name if available */
+  disk->hw_name = d->hw_name ? grub_strdup(d->hw_name) : NULL;
 
   grub_dprintf ("efidisk", "opening %s succeeded\n", name);
 
@@ -581,9 +650,15 @@ grub_efidisk_open (const char *name, struct grub_disk *disk)
 }
 
 static void
-grub_efidisk_close (struct grub_disk *disk __attribute__ ((unused)))
+grub_efidisk_close (struct grub_disk *disk)
 {
-  /* EFI disks do not allocate extra memory, so nothing to do here.  */
+  /* Free hardware name if allocated */
+  if (disk->hw_name)
+    {
+      grub_free (disk->hw_name);
+      disk->hw_name = NULL;
+    }
+  
   grub_dprintf ("efidisk", "closing %s\n", disk->name);
 }
 
